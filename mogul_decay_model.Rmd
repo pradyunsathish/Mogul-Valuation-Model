@@ -1,0 +1,280 @@
+---
+title: "mogul_decay_model"
+author: "Pradyun Sathish"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+## Libraries
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(lubridate)
+  library(forecast)
+  library(ggplot2)
+  library(minpack.lm)
+  library(tibble)
+})
+```
+
+## FILE PATH
+```{r}
+CSV_PATH <- "/Users/pradyunsathish/Desktop/Mogul/Valuation CSVs/Antho Cornelius/_royalty_record_analysis_view__202508050104.csv"
+```
+
+```{r}
+raw
+length(unique(raw$source_asset_id))
+unique(raw$rights_type)
+unique(raw$rights_type_category)
+```
+
+
+## Create Raw Revenue Tables
+```{r}
+raw <- read.csv(CSV_PATH)
+  
+raw$reporting_period <- as.Date(paste0(raw$reporting_period, "-01"), format = "%Y-%m-%d")
+
+# Monthly Revenue
+total_monthly_revenue <- raw %>%
+  group_by(reporting_period) %>%
+  summarise(revenue_usd = sum(revenue_usd, na.rm = TRUE)) %>%
+  arrange(reporting_period)
+  
+# Filter 18 months
+today_month <- floor_date(Sys.Date(), "month")
+end_date    <- today_month %m-% months(3)          
+start_date  <- end_date %m-% months(17)            
+
+filtered_monthly <- total_monthly_revenue %>%
+  filter(reporting_period >= start_date & reporting_period <= end_date) %>%
+  arrange(reporting_period)
+
+# Yearly Revenue
+yearly_revenue <- total_monthly_revenue %>%
+  mutate(Year = year(reporting_period)) %>%   # extract year from the date
+  group_by(Year) %>%
+  summarise(Revenue = sum(revenue_usd, na.rm = TRUE)) %>%
+  arrange(Year)
+```
+
+
+## Monthly Table Output
+```{r}
+total_monthly_revenue
+filtered_monthly
+yearly_revenue
+```
+
+
+## Revenue by Rights
+```{r}
+summarize_revenue_by_rights <- function(df) {
+  df <- df %>%
+    mutate(reporting_period = as.Date(reporting_period)) %>%
+    mutate(
+      Year = year(reporting_period),
+      Month = floor_date(reporting_period, "month")
+    )
+  
+  # --- Monthly summary (wide) ---
+  monthly_summary <- df %>%
+    group_by(Month, rights_type) %>%
+    summarise(monthly_revenue = sum(revenue_usd, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(
+      names_from = rights_type,
+      values_from = monthly_revenue,
+      values_fill = 0
+    )
+  
+  # --- Yearly summary (wide) ---
+  yearly_summary <- df %>%
+    group_by(Year, rights_type) %>%
+    summarise(yearly_revenue = sum(revenue_usd, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(
+      names_from = rights_type,
+      values_from = yearly_revenue,
+      values_fill = 0
+    )
+  
+  return(list(
+    monthly = monthly_summary,
+    yearly = yearly_summary
+  ))
+}
+```
+
+```{r}
+summarize_revenue_by_rights(raw)
+```
+
+
+## ETS 24 Months
+```{r}
+forecast_ets <- function(filtered_monthly) {
+  ts_data <- ts(filtered_monthly$revenue_usd, frequency = 12)
+  fit <- ets(ts_data, model = "AAN")
+  forecast_data <- forecast(fit, h = 24)
+  return(list(model = fit, forecast = forecast_data))
+}
+
+fc_ets <- forecast_ets(filtered_monthly)
+fc_ets
+
+accuracy(fc_ets$forecast)
+```
+
+## ARIMA 24 Months
+```{r}
+forecast_arima <- function(filtered_monthly) {
+  ts_data <- ts(filtered_monthly$revenue_usd, frequency = 12)
+  fit <- arima(ts_data, order = c(1,1,2))
+  forecast_data <- forecast(fit, h = 24)
+  return(list(model = fit, forecast = forecast_data))
+}
+
+fc_arima <- forecast_arima(filtered_monthly)
+fc_arima
+
+accuracy(fc_arima$forecast)
+```
+
+## RMSE Comparison
+```{r}
+accuracy(fc_ets$forecast)
+accuracy(fc_arima$forecast)
+
+ets_rmse <- accuracy(fc_ets$forecast)[1, "RMSE"]
+arima_rmse <- accuracy(fc_arima$forecast)[1, "RMSE"]
+rmse_comparison <- data.frame(
+    Model = c("ETS", "ARIMA"),
+    RMSE = c(ets_rmse, arima_rmse)
+  )
+
+rmse_comparison
+
+best_model <- ifelse(ets_rmse < arima_rmse, "ETS", "ARIMA")
+```
+
+## 7 Year Forecast
+```{r}
+forecast_years <- function(best_model, fit_ets = NULL, fit_arima = NULL, h_years = 7) {
+ 
+   # Choose which fitted model to use
+  if (best_model == "ETS") {
+    if (is.null(fit_ets)) stop("fit_ets must be provided for ETS")
+    fit <- fit_ets
+  } else if (best_model == "ARIMA") {
+    if (is.null(fit_arima)) stop("fit_arima must be provided for ARIMA")
+    fit <- fit_arima
+  } else {
+    stop("best_model must be 'ETS' or 'ARIMA'")
+  }
+  
+  # Forecast next h years
+  h_months <- 12 * h_years
+  fc <- forecast(fit, h = h_months)
+  
+  # Aggregate monthly forecast into yearly sums
+  sum_by_years <- function(fc_obj, h_years) {
+    vec <- as.numeric(fc_obj$mean)
+    stopifnot(length(vec) == h_years * 12)
+    chunks <- split(vec, rep(1:h_years, each = 12))
+    sapply(chunks, sum)
+  }
+  
+  yearly_means <- sum_by_years(fc, h_years)
+  
+  # Create table
+  year_labels <- paste("Year", 1:h_years)
+  yearly_forecast <- tibble::tibble(
+    Year = year_labels,
+    Revenue = as.numeric(yearly_means)
+  )
+  
+  return(yearly_forecast)
+}
+```
+
+```{r}
+future_years <- forecast_years(best_model, fc_ets$model, fc_arima$model)
+future_years
+```
+
+## Past Future Table
+```{r}
+past_future_revenue <- function(total_monthly_revenue, yearly_forecast) {
+  past_2_yrs <- tail(monthly_revenue_wide, 27)
+  yr1_rev <- sum(past_2_yrs$TOTAL_REVENUE[1:12])
+  yr2_rev <- sum(past_2_yrs$TOTAL_REVENUE[13:24])
+
+  past_yr_rev_df <- data.frame(
+   Year = c("Year -2", "Year -1"),   # older year first
+   Revenue = c(yr1_rev, yr2_rev)
+  )
+  
+  combined_past_future <- rbind(past_yr_rev_df, yearly_total_revenue_tbl)
+  combined_past_future
+}
+```
+
+```{r}
+combined_past_future <- past_future_revenue(total_monthly_revenue, future_years)
+combined_past_future
+```
+
+## Decay/Growth Rate
+```{r}
+# 1) Fit plateau-aware exponential model: Revenue = a * (1 - exp(-lambda * t)) + c
+plateau_fit <- nlsLM(
+  Revenue ~ a * (1 - exp(-lambda * t)) + c,
+  data = combined_past_future,
+  start = list(
+    a = max(combined_past_future$Revenue), 
+    lambda = 0.05, 
+    c = min(combined_past_future$Revenue)
+  ),
+  lower = c(a = 0, lambda = 0, c = 0),
+  control = nls.lm.control(maxiter = 500)
+)
+
+# 2) Extract coefficients
+coef_vals <- coef(plateau_fit)
+a      <- coef_vals["a"]
+lambda <- coef_vals["lambda"]  # monthly/yearly rate depending on t
+c      <- coef_vals["c"]       # plateau value
+
+# 3) Annual plateau-aware growth/decay rate
+# If t is in years (as in your combined_past_future table), use:
+annual_rate_plateau <- 1 - exp(-lambda)  
+
+# 4) Optional: Simple CAGR (ignores plateau)
+start_rev <- combined_past_future$Revenue[1]
+end_rev   <- combined_past_future$Revenue[nrow(combined_past_future)]
+n_years   <- nrow(combined_past_future) - 1
+cagr_rate <- (end_rev / start_rev)^(1 / n_years) - 1
+
+cat("CAGR rate (ignores plateau):", round(cagr_rate * 100, 2), "%\n")
+cat("Plateau-adjusted annual rate:", round(annual_rate_plateau * 100, 2), "%\n")
+cat("Plateau value (c):", round(c, 2), "\n")
+```
+
+
+## Investment Calculations
+```{r}
+base_annual_revenue <- round(sum(tail(total_monthly_revenue$revenue_usd, 12)), 2)
+year3_rev <- round(future_years$Revenue[3], 2)
+invest_low <- round(year3_rev / 1.04, 2)
+invest_high <- round(year3_rev / 1.01, 2)
+
+
+investment_values <- tibble(
+  Metric = c("Base Annual Revenue", "Year 3 Revenue", "Invest Low (4% growth)", "Invest High (1% growth)"),
+  Value = c(base_annual_revenue, year3_rev, invest_low, invest_high)
+)
+
+investment_values
+```
+
